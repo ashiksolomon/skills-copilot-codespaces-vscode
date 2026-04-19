@@ -4,18 +4,20 @@
 //|                                                                  |
 //| Strategy:                                                        |
 //|  1. At the start of each configured session, record the HIGH     |
-//|     and LOW of the first 15-minute candle (the "breakout range") |
+//|     and LOW of the first N × 15-minute candles (breakout range)  |
 //|  2. Place a BUY STOP above the range high and a SELL STOP below  |
 //|     the range low                                                |
 //|  3. When one side is triggered, cancel the other                 |
 //|  4. Optional bias filter: only take buys when price is above     |
 //|     the 200 EMA on a higher timeframe (and vice versa for sells) |
 //|  5. Market sessions are drawn as coloured background bands       |
+//|  6. Trailing stop, break-even, daily loss limit, spread filter,  |
+//|     range-size filter, RSI confluence, max-trades guard          |
 //|                                                                  |
 //| Designed for XAU/USD (GOLD) but works on any symbol.            |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -49,6 +51,29 @@ input ENUM_ORDER_TYPE_FILLING FillType = ORDER_FILLING_RETURN;
 input group "Risk Management"
 input bool   UseMoneyManagement    = true;  // Enable % risk lot sizing
 input double RiskPercent           = 1.0;   // Risk per trade (% of balance)
+input int    MaxTrades             = 2;     // Max concurrent open positions (0 = unlimited)
+input double MaxDailyLossPercent   = 3.0;  // Stop trading when daily loss exceeds this % (0 = off)
+input int    MaxSpreadPoints       = 50;   // Skip trade if spread > this many points (0 = off)
+
+input group "Range Size Filter"
+input int    MinRangePips          = 50;   // Skip if breakout range is narrower than this (pips)
+input int    MaxRangePips          = 500;  // Skip if breakout range is wider than this (spike guard)
+
+input group "Trailing Stop"
+input bool   UseTrailingStop       = true; // Enable trailing stop loss
+input int    TrailingStartPips     = 100;  // Profit in pips before trailing activates
+input int    TrailingDistPips      = 80;   // Keep SL this many pips behind current price
+input int    TrailingStepPips      = 20;   // Minimum SL improvement per move (pips)
+
+input group "Break-Even"
+input bool   UseBreakEven          = true; // Move SL to break-even after sufficient profit
+input int    BreakEvenAtPips       = 100;  // Profit in pips required to activate break-even
+input int    BreakEvenExtraPips    = 2;    // Extra pips beyond entry for the break-even SL
+
+input group "RSI Confluence Filter"
+input bool            UseRSIFilter   = false;       // Require RSI alignment before entry
+input ENUM_TIMEFRAMES RSITimeframe   = PERIOD_M5;   // Timeframe for RSI calculation
+input int             RSIPeriod      = 14;          // RSI period
 
 input group "Bias Filter (Higher Timeframe)"
 input bool              UseBiasFilter  = true;       // Filter trades by HTF trend
@@ -83,7 +108,10 @@ struct SessionInfo
 //| Globals                                                          |
 //+------------------------------------------------------------------+
 CTrade     trade;
-int        biasEMAHandle = INVALID_HANDLE;
+int        biasEMAHandle    = INVALID_HANDLE;
+int        rsiHandle        = INVALID_HANDLE;
+double     dailyStartBalance = 0;
+datetime   lastDayChecked   = 0;
 
 SessionInfo sessions[4]; // London, NewYork, Tokyo, Sydney
 
@@ -143,6 +171,111 @@ void InitSessions()
   }
 
 //+------------------------------------------------------------------+
+//| On restart: scan live pending orders and restore session tickets  |
+//+------------------------------------------------------------------+
+void RestoreSessionTickets()
+  {
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket))                          continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)       continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber)   continue;
+
+      ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+
+      for(int s = 0; s < 4; s++)
+        {
+         if(otype == ORDER_TYPE_BUY_STOP && sessions[s].buyStopTicket == 0)
+           {
+            sessions[s].buyStopTicket = ticket;
+            Print("Restored BUY STOP #", ticket, " for ", sessions[s].name);
+           }
+         else if(otype == ORDER_TYPE_SELL_STOP && sessions[s].sellStopTicket == 0)
+           {
+            sessions[s].sellStopTicket = ticket;
+            Print("Restored SELL STOP #", ticket, " for ", sessions[s].name);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Return true if a pending order was genuinely filled              |
+//+------------------------------------------------------------------+
+bool WasOrderFilled(ulong ticket)
+  {
+   if(ticket == 0)         return false;
+   if(OrderSelect(ticket)) return false;  // still pending → not filled
+   if(HistoryOrderSelect(ticket))
+     {
+      ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)HistoryOrderGetInteger(ticket, ORDER_STATE);
+      return (state == ORDER_STATE_FILLED);
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Count open positions belonging to this EA on this symbol         |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+  {
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))                   continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)     continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      count++;
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Reset daily start balance at the beginning of each new day       |
+//+------------------------------------------------------------------+
+void CheckResetDailyBalance()
+  {
+   if(MaxDailyLossPercent <= 0)
+      return;
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   datetime today = StructToTime(dt);
+   if(today != lastDayChecked)
+     {
+      dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      lastDayChecked    = today;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Return true when today's drawdown has exceeded the daily limit   |
+//+------------------------------------------------------------------+
+bool IsDailyLossLimitReached()
+  {
+   if(MaxDailyLossPercent <= 0 || dailyStartBalance <= 0)
+      return false;
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossLimit = dailyStartBalance * MaxDailyLossPercent / 100.0;
+   return (dailyStartBalance - equity >= lossLimit);
+  }
+
+//+------------------------------------------------------------------+
+//| Return true if the current spread is within the allowed limit    |
+//+------------------------------------------------------------------+
+bool IsSpreadOK()
+  {
+   if(MaxSpreadPoints <= 0)
+      return true;
+   double spreadPoints = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID))
+                         / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return (spreadPoints <= MaxSpreadPoints);
+  }
+
+//+------------------------------------------------------------------+
 //| Check if a given server-time is within a session window          |
 //| Handles overnight sessions (open > close, e.g. Sydney 22-07)    |
 //+------------------------------------------------------------------+
@@ -189,6 +322,24 @@ int GetBias()
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(price > ema[0]) return  1;
    if(price < ema[0]) return -1;
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| RSI momentum bias: +1 = bullish (>50), -1 = bearish (<50)       |
+//+------------------------------------------------------------------+
+int GetRSIBias()
+  {
+   if(!UseRSIFilter || rsiHandle == INVALID_HANDLE)
+      return 0; // disabled → no filter
+
+   double rsiVal[];
+   ArraySetAsSeries(rsiVal, true);
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiVal) < 1)
+      return 0;
+
+   if(rsiVal[0] > 50.0) return  1;
+   if(rsiVal[0] < 50.0) return -1;
    return 0;
   }
 
@@ -284,12 +435,36 @@ double CalculateLotSize(double slDistance)
 //+------------------------------------------------------------------+
 void PlaceBreakoutOrders(SessionInfo &s)
   {
+   // --- Pre-trade guards ---
+   if(!IsSpreadOK())
+     { Print(s.name, " skipped: spread too wide."); return; }
+
+   if(MaxTrades > 0 && CountOpenPositions() >= MaxTrades)
+     { Print(s.name, " skipped: max open trades (", MaxTrades, ") reached."); return; }
+
+   if(IsDailyLossLimitReached())
+     { Print(s.name, " skipped: daily loss limit reached."); return; }
+
    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    int    mult   = PipMultiplier();
-   double slDist = StopLossPips   * mult * point;
-   double tpDist = TakeProfitPips * mult * point;
-   int    bias   = GetBias();
+
+   // --- Range size filter ---
+   double rangePips = (s.rangeHigh - s.rangeLow) / (mult * point);
+   if(MinRangePips > 0 && rangePips < MinRangePips)
+     { Print(s.name, " skipped: range too narrow (", rangePips, " pips < ", MinRangePips, ")."); return; }
+   if(MaxRangePips > 0 && rangePips > MaxRangePips)
+     { Print(s.name, " skipped: range too wide (", rangePips, " pips > ", MaxRangePips, "). Possible spike."); return; }
+
+   double slDist  = StopLossPips   * mult * point;
+   double tpDist  = TakeProfitPips * mult * point;
+   int    htfBias = GetBias();
+   int    rsiBias = GetRSIBias();
+
+   // Both filters gate their respective directions independently.
+   // A value of 0 means the filter is disabled → no restriction from that filter.
+   bool buyAllowed  = (htfBias >= 0) && (rsiBias >= 0);
+   bool sellAllowed = (htfBias <= 0) && (rsiBias <= 0);
 
    // Expiry datetime
    datetime expiry = 0;
@@ -299,7 +474,7 @@ void PlaceBreakoutOrders(SessionInfo &s)
    double lot = CalculateLotSize(slDist);
 
    // --- BUY STOP ---
-   if(bias >= 0) // allow buy when bullish or no filter
+   if(buyAllowed)
      {
       double buyEntry = NormalizeDouble(s.rangeHigh + point, digits);
       double buySL    = NormalizeDouble(buyEntry - slDist, digits);
@@ -316,7 +491,7 @@ void PlaceBreakoutOrders(SessionInfo &s)
      }
 
    // --- SELL STOP ---
-   if(bias <= 0) // allow sell when bearish or no filter
+   if(sellAllowed)
      {
       double sellEntry = NormalizeDouble(s.rangeLow - point, digits);
       double sellSL    = NormalizeDouble(sellEntry + slDist, digits);
@@ -365,9 +540,8 @@ void CheckAndCancelOpposite(SessionInfo &s)
    if(!CancelOppositeOnFill)
       return;
 
-   // If buy stop has been triggered (position opened), cancel sell stop
-   bool buyFilled  = (s.buyStopTicket  != 0 && !OrderSelect(s.buyStopTicket));
-   bool sellFilled = (s.sellStopTicket != 0 && !OrderSelect(s.sellStopTicket));
+   bool buyFilled  = WasOrderFilled(s.buyStopTicket);
+   bool sellFilled = WasOrderFilled(s.sellStopTicket);
 
    if(buyFilled  && s.sellStopTicket != 0) CancelOrder(s.sellStopTicket);
    if(sellFilled && s.buyStopTicket  != 0) CancelOrder(s.buyStopTicket);
@@ -378,31 +552,30 @@ void CheckAndCancelOpposite(SessionInfo &s)
 //+------------------------------------------------------------------+
 bool BuildRange(SessionInfo &s, datetime sessionStart)
   {
-   // Get M15 bars from sessionStart
-   datetime barTimes[];
-   double   highs[], lows[];
-   ArraySetAsSeries(barTimes, false);
-   ArraySetAsSeries(highs,    false);
-   ArraySetAsSeries(lows,     false);
+   double highs[], lows[];
+   ArraySetAsSeries(highs, false);
+   ArraySetAsSeries(lows,  false);
 
    // Find index of the bar at or just after session start
    int startIdx = iBarShift(_Symbol, PERIOD_M15, sessionStart, false);
    if(startIdx < 0)
+     {
+      Print("WARNING: iBarShift returned -1 for ", s.name, " session start. History not loaded?");
       return false;
+     }
 
-   // We need BreakoutCandles bars starting from startIdx
-   // CopyHigh/CopyLow with start position (oldest first)
    int needed = BreakoutCandles;
-   if(CopyHigh(_Symbol, PERIOD_M15, startIdx, needed, highs) < needed)
+   int gotH   = CopyHigh(_Symbol, PERIOD_M15, startIdx, needed, highs);
+   int gotL   = CopyLow (_Symbol, PERIOD_M15, startIdx, needed, lows);
+   if(gotH < needed || gotL < needed)
+     {
+      Print("WARNING: Insufficient M15 history for ", s.name,
+            " (got ", MathMin(gotH, gotL), "/", needed, " bars). Skipping.");
       return false;
-   if(CopyLow (_Symbol, PERIOD_M15, startIdx, needed, lows)  < needed)
-      return false;
+     }
 
-   double hi = highs[ArrayMaximum(highs)];
-   double lo = lows [ArrayMinimum(lows)];
-
-   s.rangeHigh = hi;
-   s.rangeLow  = lo;
+   s.rangeHigh = highs[ArrayMaximum(highs)];
+   s.rangeLow  = lows [ArrayMinimum(lows)];
    return true;
   }
 
@@ -452,6 +625,99 @@ datetime TodaySessionClose(const SessionInfo &s)
   }
 
 //+------------------------------------------------------------------+
+//| Move SL to break-even for all EA positions when profit >= target |
+//+------------------------------------------------------------------+
+void ManageBreakEven()
+  {
+   if(!UseBreakEven)
+      return;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    mult  = PipMultiplier();
+   double bePips = BreakEvenAtPips    * mult * point;
+   double extra  = BreakEvenExtraPips * mult * point;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))                   continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)     continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(posType == POSITION_TYPE_BUY)
+        {
+         double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double beSL = NormalizeDouble(openPrice + extra, _Digits);
+         // Only modify if profit target reached and SL hasn't already been moved to BE
+         if(bid - openPrice >= bePips && currentSL < beSL && currentSL != beSL)
+            trade.PositionModify(ticket, beSL, currentTP);
+        }
+      else if(posType == POSITION_TYPE_SELL)
+        {
+         double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double beSL = NormalizeDouble(openPrice - extra, _Digits);
+         // Only modify if profit target reached and SL hasn't already been moved to BE
+         if(openPrice - ask >= bePips && currentSL > beSL && currentSL != beSL)
+            trade.PositionModify(ticket, beSL, currentTP);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Trail stop loss for all open EA positions                        |
+//+------------------------------------------------------------------+
+void TrailOpenPositions()
+  {
+   if(!UseTrailingStop)
+      return;
+
+   double point      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    mult       = PipMultiplier();
+   double trailDist  = TrailingDistPips  * mult * point;
+   double trailStart = TrailingStartPips * mult * point;
+   double trailStep  = TrailingStepPips  * mult * point;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))                   continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)     continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(posType == POSITION_TYPE_BUY)
+        {
+         double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(bid - openPrice < trailStart)
+            continue;
+         double newSL = NormalizeDouble(bid - trailDist, _Digits);
+         // Only move SL upward and only when improvement >= minimum step
+         if(newSL >= currentSL + trailStep)
+            trade.PositionModify(ticket, newSL, currentTP);
+        }
+      else if(posType == POSITION_TYPE_SELL)
+        {
+         double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(openPrice - ask < trailStart)
+            continue;
+         double newSL = NormalizeDouble(ask + trailDist, _Digits);
+         // Only move SL downward and only when improvement >= minimum step
+         if(newSL <= currentSL - trailStep)
+            trade.PositionModify(ticket, newSL, currentTP);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Expert initialisation                                            |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -467,11 +733,28 @@ int OnInit()
         }
      }
 
+   if(UseRSIFilter)
+     {
+      rsiHandle = iRSI(_Symbol, RSITimeframe, RSIPeriod, PRICE_CLOSE);
+      if(rsiHandle == INVALID_HANDLE)
+         Print("WARNING: Could not create RSI handle. RSI filter disabled.");
+     }
+
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
    trade.SetTypeFilling(FillType);
 
-   Print("SessionBreakoutEA initialized on ", _Symbol, " / ", EnumToString(_Period));
+   // Initialise daily loss tracking
+   dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   lastDayChecked = StructToTime(dt);
+
+   // Recover pending order tickets that existed before an EA restart
+   RestoreSessionTickets();
+
+   Print("SessionBreakoutEA v2 initialized on ", _Symbol, " / ", EnumToString(_Period));
    return INIT_SUCCEEDED;
   }
 
@@ -480,8 +763,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   if(biasEMAHandle != INVALID_HANDLE)
-      IndicatorRelease(biasEMAHandle);
+   if(biasEMAHandle != INVALID_HANDLE) IndicatorRelease(biasEMAHandle);
+   if(rsiHandle     != INVALID_HANDLE) IndicatorRelease(rsiHandle);
 
    // Clean up chart objects created by this EA
    for(int i = 0; i < 4; i++)
@@ -500,8 +783,27 @@ void OnTick()
   {
    datetime now = TimeCurrent();
 
+   // Update daily loss tracking (resets at midnight)
+   CheckResetDailyBalance();
+
+   // Trailing stop and break-even management run every tick
+   TrailOpenPositions();
+   ManageBreakEven();
+
    if(IsNewsWindow(now))
       return;
+
+   // Guard: stop opening new positions if daily drawdown limit is breached
+   if(IsDailyLossLimitReached())
+     {
+      static datetime lastLimitWarn = 0;
+      if(now - lastLimitWarn > 3600)
+        {
+         Print("Daily loss limit reached. No new trades until tomorrow.");
+         lastLimitWarn = now;
+        }
+      return;
+     }
 
    MqlDateTime dt;
    TimeToStruct(now, dt);
